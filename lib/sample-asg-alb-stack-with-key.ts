@@ -1,9 +1,9 @@
+import * as fs from "fs";
 import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as autoscaling from "aws-cdk-lib/aws-autoscaling";
-import * as s3 from "aws-cdk-lib/aws-s3";
-import { readFileSync } from "fs";
+import { Duration } from "aws-cdk-lib";
 
 export class SampleAsgAlbStack extends cdk.Stack {
   constructor(scope: cdk.App, id: string, props?: cdk.StackProps) {
@@ -26,8 +26,7 @@ export class SampleAsgAlbStack extends cdk.Stack {
           mapPublicIpOnLaunch: true,
         },
         {
-          // private subnet is outbound only
-          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
           name: "Private",
           cidrMask: 24,
         },
@@ -36,13 +35,11 @@ export class SampleAsgAlbStack extends cdk.Stack {
       enableDnsSupport: true,
     });
 
-    // Security group for EC2 instances (allows HTTP and SSH)
     const instanceSecurityGroup = new ec2.SecurityGroup(
       this,
       "InstanceSecurityGroup",
       {
         vpc,
-        allowAllOutbound: true,
       }
     );
     instanceSecurityGroup.addIngressRule(
@@ -56,10 +53,8 @@ export class SampleAsgAlbStack extends cdk.Stack {
       "Allow SSH"
     );
 
-    // Security group for the Application Load Balancer (allows HTTP and SSH, allows all egress)
     const elbSecurityGroup = new ec2.SecurityGroup(this, "ElbSecurityGroup", {
       vpc,
-      allowAllOutbound: true,
     });
     elbSecurityGroup.addIngressRule(
       ec2.Peer.anyIpv4(),
@@ -71,8 +66,12 @@ export class SampleAsgAlbStack extends cdk.Stack {
       ec2.Port.tcp(22),
       "Allow SSH"
     );
+    elbSecurityGroup.addEgressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.allTcp(),
+      "Allow all outbound"
+    );
 
-    // Internet-facing Application Load Balancer in the public subnets
     const elb = new elbv2.ApplicationLoadBalancer(this, "Elb", {
       securityGroup: elbSecurityGroup,
       vpc,
@@ -82,13 +81,17 @@ export class SampleAsgAlbStack extends cdk.Stack {
       internetFacing: true,
     });
 
-    // S3 bucket for storing ALB access logs
-    const logsBucket = new s3.Bucket(this, "LogsBucket");
-    elb.logAccessLogs(logsBucket);
-
-    // Target group for the ALB, adds EC2 instances
     const targetGroup = new elbv2.ApplicationTargetGroup(this, "TargetGroup", {
       port: 80,
+      healthCheck: {
+        healthyThresholdCount: 2,
+        unhealthyThresholdCount: 3,
+
+        timeout: Duration.seconds(10),
+        interval: Duration.seconds(30),
+        path: "/",
+        healthyHttpCodes: "200-299",
+      },
       vpc,
       targetType: elbv2.TargetType.INSTANCE,
     });
@@ -98,30 +101,27 @@ export class SampleAsgAlbStack extends cdk.Stack {
       defaultAction: elbv2.ListenerAction.forward([targetGroup]),
     });
 
-    // load user data script from file
-    const userDataScript = readFileSync("./sh/user-data.sh", "utf8");
+    const keyMaterial = fs.readFileSync("/path/to/key.pub").toString();
 
-    // Launch template for the instance configuration: Amazon Linux 2, t2.micro and init script
+    const key = new ec2.CfnKeyPair(this, "KeyPair", {
+      keyName: "instanceKey",
+      publicKeyMaterial: keyMaterial,
+    });
+
     const launchTemplate = new ec2.LaunchTemplate(this, "LaunchTemplate", {
-      machineImage: new ec2.AmazonLinuxImage({
-        generation: ec2.AmazonLinuxGeneration.AMAZON_LINUX_2,
-        cpuType: ec2.AmazonLinuxCpuType.X86_64,
-      }),
+      machineImage: new ec2.AmazonLinuxImage(),
       instanceType: ec2.InstanceType.of(
         ec2.InstanceClass.T2,
         ec2.InstanceSize.MICRO
       ),
       securityGroup: instanceSecurityGroup,
-      // add user data script to run for every instance, sets up httpd/Apache Web server and dependencies
-      userData: ec2.UserData.custom(userDataScript),
+      keyName: key.keyName,
     });
 
-    // prolonged grace period to allow EC2 instances sometime to start up before health checks begin
     const healthCheck = autoscaling.HealthCheck.ec2({
       grace: cdk.Duration.minutes(30),
     });
 
-    // Auto Scaling Group
     const asg = new autoscaling.AutoScalingGroup(this, "AutoscalingGroup", {
       launchTemplate,
       vpc,
@@ -129,12 +129,11 @@ export class SampleAsgAlbStack extends cdk.Stack {
         subnets: [vpc.publicSubnets[0], vpc.publicSubnets[1]],
       },
       // update the capacity values as necessary
-      minCapacity: 2,
-      desiredCapacity: 2,
-      maxCapacity: 3,
+      minCapacity: 1,
+      desiredCapacity: 1,
+      maxCapacity: 2,
       healthCheck,
     });
-    // register the target group with the ASG so the instances can receive traffic
     asg.attachToApplicationTargetGroup(targetGroup);
 
     // outputs for resources that other stacks can use
